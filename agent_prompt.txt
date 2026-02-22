@@ -1,0 +1,1 @@
+Extract only the letter grid from this wordsearch image. Return ONLY a valid JSON array of arrays.  Example: [   ["S","T","U","D","I","O"],   ["C","A","N","H","O","L"] ]  Do not include any extra text or explanation.

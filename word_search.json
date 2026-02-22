@@ -1,0 +1,20 @@
+{
+  "grid": [
+    ["S","T","U","D","I","O","L","B","A","T","H","R","O","O","M"],
+    ["C","A","N","H","O","L","L","O","W","W","A","L","L","A","T"],
+    ["P","O","T","I","E","C","L","D","A","E","T","S","D","E","B"],
+    ["E","A","L","W","I","N","D","O","W","S","I","L","L","B","C"],
+    ["T","S","N","O","I","T","A","D","N","U","O","F","D","E","H"]
+  ],
+  "words_to_find": [
+    "WINDOWSILL",
+    "DRAINPIPE",
+    "HOLLOWPIPE",
+    "STUDIO",
+    "BATHROOM",
+    "CHIMNEY",
+    "GARAGE",
+    "GUTTER",
+    "OFFICE"
+  ]
+}
