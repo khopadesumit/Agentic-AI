@@ -1,0 +1,470 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Create an Amazon Bedrock Knowledge Base with S3 data source
+
+Resources:
+  S3Bucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      BucketName: !Sub "bedrock-kb-${AWS::AccountId}-${AWS::Region}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+    
+  S3BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref S3Bucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !GetAtt BedrockServiceRole.Arn
+            Action:
+              - "s3:GetObject"
+              - "s3:PutObject"
+            Resource:
+              - !Sub "arn:${AWS::Partition}:s3:::${S3Bucket}/*"
+          - Effect: Allow
+            Principal:
+              AWS: !GetAtt BedrockServiceRole.Arn
+            Action:
+              - "s3:ListBucket"
+            Resource:
+              - !Sub "arn:${AWS::Partition}:s3:::${S3Bucket}"
+          - Effect: Allow
+            Principal:
+              AWS: !GetAtt LambdaExecutionRole.Arn
+            Action:
+              - "s3:GetObject"
+              - "s3:PutObject"
+            Resource:
+              - !Sub "arn:${AWS::Partition}:s3:::${S3Bucket}/*"
+          - Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource: 
+              - !Sub '${S3Bucket.Arn}'
+              - !Sub '${S3Bucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+  DeleteS3Bucket:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-DeleteS3Bucket"
+      Handler: index.lambda_handler
+      Description: "Delete all objects in S3 bucket"
+      Timeout: 30
+      Role: !GetAtt 'LambdaS3BasicExecutionRole.Arn'
+      Runtime: python3.12
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref S3Bucket
+      Code:
+        ZipFile: |
+          import boto3, logging
+          import cfnresponse
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def lambda_handler(event, context):
+              logger.info("event: {}".format(event))
+              try:
+                  bucket = event['ResourceProperties']['BucketName']
+                  logger.info("bucket: {}, event['RequestType']: {}".format(bucket,event['RequestType']))
+                  if event['RequestType'] == 'Delete':
+                      s3 = boto3.resource('s3')
+                      bucket = s3.Bucket(bucket)
+                      for obj in bucket.objects.filter():
+                          logger.info("delete obj: {}".format(obj))
+                          s3.Object(bucket.name, obj.key).delete()
+
+                  sendResponseCfn(event, context, cfnresponse.SUCCESS)
+              except Exception as e:
+                  logger.info("Exception: {}".format(e))
+                  sendResponseCfn(event, context, cfnresponse.FAILED)
+
+          def sendResponseCfn(event, context, responseStatus):
+              responseData = {}
+              responseData['Data'] = {}
+              cfnresponse.send(event, context, responseStatus, responseData, "CustomResourcePhysicalID")   
+                
+  OpenSearchDataAccessPolicy:
+    Type: 'AWS::OpenSearchServerless::AccessPolicy'
+    Properties:
+      Name: !Sub "kb-${AWS::AccountId}-acc-policy"
+      Type: data
+      Description: Access policy for my-collection
+      Policy:
+        !Sub >-
+         [{"Description":"Access for
+         kb-role","Rules":[{"ResourceType":"index","Resource":["index/*/*"],"Permission":["aoss:*"]},
+         {"ResourceType":"collection","Resource":["collection/bedrock-kb-${AWS::AccountId}"],"Permission":["aoss:*"]}],
+         "Principal":["${BedrockServiceRole.Arn}","${LambdaExecutionRole.Arn}","arn:${AWS::Partition}:sts::${AWS::AccountId}:assumed-role/${LambdaExecutionRole}/*",
+         "arn:${AWS::Partition}:sts::${AWS::AccountId}:assumed-role/${BedrockServiceRole}/*"]}]
+  NetworkPolicy:
+    Type: 'AWS::OpenSearchServerless::SecurityPolicy'
+    Properties:
+      Name: !Sub "kb-${AWS::AccountId}-net-policy"
+      Type: network
+      Description: Network policy for AOSS collection
+      Policy: !Sub >-
+        [{"Rules":[{"ResourceType":"collection","Resource":["collection/bedrock-kb-${AWS::AccountId}"]}, {"ResourceType":"dashboard","Resource":["collection/bedrock-kb-${AWS::AccountId}"]}],"AllowFromPublic":true}]
+  EncryptionPolicy:
+    Type: 'AWS::OpenSearchServerless::SecurityPolicy'
+    Properties:
+      Name: !Sub "kb-${AWS::AccountId}-enc-policy"
+      Type: encryption
+      Description: Encryption policy for AOSS collection
+      Policy: !Sub >-
+        {"Rules":[{"ResourceType":"collection","Resource":["collection/bedrock-kb-${AWS::AccountId}"]}],"AWSOwnedKey":true}
+
+  OpenSearchCollection:
+    Type: AWS::OpenSearchServerless::Collection
+    Properties:
+      Name: !Sub "bedrock-kb-${AWS::AccountId}"
+      Description: OpenSearch Serverless collection for Bedrock Knowledge Base
+      Type: VECTORSEARCH
+    DependsOn: EncryptionPolicy
+
+
+  CopyObjectFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-CopyObjectFunction"
+      
+      Code:
+        ZipFile: |
+          import boto3, logging
+          import cfnresponse
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def handler(event, context):
+            logger.info('got event {}'.format(event))
+            if event['RequestType'] == 'Delete':
+              logger.info(f"copy files function called at the time of stack deletion, skipping")
+              response = dict(files_copied=0, error=None)
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, response)
+              return
+            s3 = boto3.client('s3')
+            source_bucket = 'ws-assets-prod-iad-r-pdx-f3b3f9f1a7d6a3d0'
+            source_key = '7ca892c2-91a4-47a7-a675-22c9e85b5e18/Gift-wrapping.txt'
+            dest_bucket = event['ResourceProperties']['DestBucket']
+            dest_key = 'Gift-wrapping.txt'
+
+            try:
+              s3.copy_object(Bucket=dest_bucket, Key=dest_key, CopySource={'Bucket': source_bucket, 'Key': source_key})
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+            except Exception as e:
+              cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})
+      Handler: index.handler
+      Runtime: python3.12
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+
+  CopyObjectCustomResource:
+    Type: Custom::CopyObject
+    Properties:
+      ServiceToken: !GetAtt CopyObjectFunction.Arn
+      DestBucket: !Ref S3Bucket
+    DependsOn: S3BucketPolicy
+
+  cleanupBucketOnDelete:
+    Type: Custom::cleanupbucket
+    Properties:
+      ServiceToken: !GetAtt 'DeleteS3Bucket.Arn'
+      BucketName: !Ref S3Bucket
+
+  BedrockKnowledgeBase:
+    Type: AWS::Bedrock::KnowledgeBase
+    Properties:
+      Name: GiftWrappingKnowledgeBase
+      Description: Knowledge Base for Gift Wrapping
+      RoleArn: !GetAtt BedrockServiceRole.Arn
+      KnowledgeBaseConfiguration:
+        Type: "VECTOR"
+        VectorKnowledgeBaseConfiguration:
+          EmbeddingModelArn: !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/amazon.titan-embed-text-v1"
+      StorageConfiguration:
+        Type: "OPENSEARCH_SERVERLESS"
+        OpensearchServerlessConfiguration:
+          CollectionArn: !GetAtt OpenSearchCollection.Arn
+          VectorIndexName: "bedrock-knowledge-base-default-index"
+          FieldMapping:
+            VectorField: "bedrock-knowledge-base-default-vector"
+            TextField: "AMAZON_BEDROCK_TEXT_CHUNK"
+            MetadataField: "AMAZON_BEDROCK_METADATA"
+    DependsOn: 
+      - OpenSearchDataAccessPolicy
+      - CreateIndexCustomResource
+    
+
+  BedrockDataSource:
+    Type: AWS::Bedrock::DataSource
+    Properties:
+      KnowledgeBaseId: !Ref BedrockKnowledgeBase
+      Name: GiftWrappingDataSource
+      Description: Data source for Gift Wrapping
+      DataSourceConfiguration:
+        Type: "S3"
+        S3Configuration:
+          BucketArn: !GetAtt S3Bucket.Arn
+          InclusionPrefixes: ["Gift-wrapping.txt"]
+
+  BedrockServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock.amazonaws.com
+            Action: "sts:AssumeRole"
+            Condition:
+              StringEquals:
+                "aws:SourceAccount": !Sub "${AWS::AccountId}"
+              ArnLike:
+                "AWS:SourceArn": !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:knowledge-base/*"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonBedrockFullAccess
+        - !Ref OpenSearchAccessPolicy
+        - !Ref KMSDecryptPolicy
+        - !Ref BedrockModelAccessPolicy
+        - !Ref BedrockKnowledgeBaseS3AccessPolicy
+
+  BedrockKnowledgeBaseS3AccessPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action:
+              - "s3:GetObject"
+              - "s3:ListBucket"
+              - s3:Describe*
+              - s3-object-lambda:Get*
+              - s3-object-lambda:List*
+            Resource:
+              - !Sub "arn:${AWS::Partition}:s3:::${S3Bucket}/*"
+            Condition:
+              StringEquals:
+                "aws:ResourceAccount": !Ref AWS::AccountId
+
+  OpenSearchAccessPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action:
+              - "aoss:APIAccessAll"
+            Resource:
+              - !GetAtt OpenSearchCollection.Arn
+  BedrockModelAccessPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action:
+              - "bedrock:InvokeModel"
+            Resource:
+              - !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/*"
+          - Effect: Allow
+            Action:
+              - bedrock:ListCustomModels
+            Resource: 
+              - !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}::custom-model/*"
+  
+  KMSDecryptPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action:
+              - "kms:Decrypt"
+              - "kms:GenerateDataKey"
+            Resource:
+              - !Sub "arn:${AWS::Partition}:kms:${AWS::Region}:${AWS::AccountId}:alias/aws/*"
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: "sts:AssumeRole"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess
+        - !Ref OpenSearchAccessPolicy
+        - !Ref KMSDecryptPolicy
+ 
+  LambdaS3BasicExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: lambda.amazonaws.com
+          Action: sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: arn:aws:logs:*:*:*
+              - Effect: Allow
+                Action:
+                  - "s3:GetObject"
+                  - "s3:PutObject"
+                  - "s3:ListBucket"
+                  - "s3:DeleteObject"
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:s3:::${S3Bucket}/*"
+                  - !Sub "arn:${AWS::Partition}:s3:::${S3Bucket}"
+                Condition:
+                  StringEquals:
+                    "aws:ResourceAccount": !Ref AWS::AccountId
+
+  CreateIndexFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-CreateIndexFunction"
+      Layers:
+        - !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:336392948345:layer:AWSSDKPandas-Python312:12'
+      Code:
+        ZipFile: |
+          from opensearchpy import OpenSearch, RequestsHttpConnection, AWSV4SignerAuth
+          from requests_aws4auth import AWS4Auth
+          import boto3
+          import time
+          import cfnresponse
+          import json
+
+          def handler(event, context):
+            try:
+                print(f"Received event: {json.dumps(event)}")
+                
+
+                index_name = 'bedrock-knowledge-base-default-index'
+                collection_arn = event['ResourceProperties']['CollectionArn']
+                client = boto3.client('opensearchserverless')
+                HOST = event['ResourceProperties']['DomainEndpoint']
+                service = 'aoss'
+                region = event['ResourceProperties']['Region']
+                credentials = boto3.Session().get_credentials()
+                awsauth = AWSV4SignerAuth(credentials, region, service)
+                host = HOST.split("//")[1]
+                print(f"host {host}")
+                opensearch = OpenSearch(
+                    hosts=[{'host': host, 'port': 443}],
+                    http_auth=awsauth,
+                    use_ssl=True,
+                    verify_certs=True,
+                    connection_class=RequestsHttpConnection,
+                    timeout=300
+                )
+                if event["RequestType"] == "Create":
+                            time.sleep(60) 
+                            print(f"Creating index: {index_name}")
+
+                            index_body = {
+                                "settings": {
+                                    "index.knn": True,
+                                    "index.knn.algo_param.ef_search": 512,
+                                },
+                                "mappings": {
+                                    "properties": {  
+                                        "bedrock-knowledge-base-default-vector": {  
+                                            "type": "knn_vector",
+                                            "dimension": 1536,
+                                            "method": {  
+                                                "space_type": "innerproduct",
+                                                "engine": "FAISS",
+                                                "name": "hnsw",
+                                                "parameters": {
+                                                    "m": 16,
+                                                    "ef_construction": 512,
+                                                },
+                                            },
+                                        },
+                                        "AMAZON_BEDROCK_METADATA": {"type": "text", "index": False},
+                                        "AMAZON_BEDROCK_TEXT_CHUNK": {"type": "text"},
+                                        "id": {"type": "text"},
+                                    }
+                                },
+                            }
+
+                            response = opensearch.indices.create(index_name, body=index_body)
+
+                            print(f"Response: {response}")
+
+                            print("Sleeping for 1 minutes to let index create.")
+                            time.sleep(60)  
+
+                elif event["RequestType"] == "Delete":
+                    print(f"Deleting index: {index_name}")
+                    response = opensearch.indices.delete(index_name)
+                    print(f"Response: {response}")
+                else:
+                    print("Continuing without action.")
+
+                print(f"Index creation response: {response}")
+                cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+            except Exception as e:
+                print(f"Error creating index: {e}")
+                cfnresponse.send(event, context, cfnresponse.FAILED, {})
+
+      Handler: index.handler
+      Runtime: python3.12
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 300
+
+  CreateIndexCustomResource:
+    Type: Custom::CreateIndex
+    Properties:
+      ServiceToken: !GetAtt CreateIndexFunction.Arn
+      CollectionArn: !GetAtt OpenSearchCollection.Arn
+      Region: !Ref AWS::Region
+      DomainEndpoint: !GetAtt OpenSearchCollection.CollectionEndpoint
+    DependsOn: 
+      - OpenSearchDataAccessPolicy
+      - NetworkPolicy
+     
+Outputs:
+  KnowledgeBaseArn:
+    Description: The ARN of the created Knowledge Base
+    Value: !Ref BedrockKnowledgeBase
+  S3BucketName:
+    Description: The name of the created S3 bucket
+    Value: !Ref S3Bucket
+  OpenSearchCollectionArn:
+    Description: The ARN of the created OpenSearch Serverless collection
+    Value: !GetAtt OpenSearchCollection.Arn
